@@ -386,7 +386,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 ):
                     network_candidates.append(url)
 
-            page.on("response", capture_response)
+            context.on("response", capture_response)
             page.goto(kwik_page_link, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
@@ -408,12 +408,15 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 page.wait_for_timeout(5000)
                 break
 
+            popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
             if network_candidates:
                 resolved[kwik_page_link] = network_candidates[-1]
+            elif popup_urls:
+                resolved[kwik_page_link] = popup_urls[-1]
             elif page.url != kwik_page_link and "kwik" not in page.url:
                 resolved[kwik_page_link] = page.url
 
-            page.remove_listener("response", capture_response)
+            context.remove_listener("response", capture_response)
 
         browser.close()
     return resolved
