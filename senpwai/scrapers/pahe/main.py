@@ -402,6 +402,7 @@ class GetDirectDownloadLinks(ProgressFunction):
         progress_update_callback: Callable[[int], None] | None = None,
     ) -> list[str]:
         direct_download_links: list[str] = []
+        _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
         for pahewin_link in pahewin_download_page_links:
             # Extract kwik page links
             pahewin_html_page = CLIENT.get(pahewin_link).text
@@ -440,8 +441,13 @@ class GetDirectDownloadLinks(ProgressFunction):
                 data={"_token": token_value},
                 allow_redirects=False,
             )
-            direct_download_link = response.headers["Location"]
-            direct_download_links.append(direct_download_link)
+            direct_download_link = response.headers.get("Location")
+            if not direct_download_link:
+                browser_resolved_link = _get_direct_link_with_browser(kwik_page_link)
+                if browser_resolved_link:
+                    direct_download_links.append(browser_resolved_link)
+            else:
+                direct_download_links.append(direct_download_link)
             self.resume.wait()
             if self.cancelled:
                 return []
