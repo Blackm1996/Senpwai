@@ -34,7 +34,10 @@ COOKIES = {"__ddg1_": "", "__ddg2_": ""}
 
 
 def _playwright_is_available() -> bool:
-    return importlib.util.find_spec("playwright.sync_api") is not None
+    try:
+        return importlib.util.find_spec("playwright.sync_api") is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def _refresh_pahe_cookies_with_browser(url: str) -> bool:
