@@ -1200,7 +1200,7 @@ class GetDirectDownloadLinksThread(QThread):
         if not self.anime_details.ddls_or_segs_urls:
             self.download_window.main_window.tray_icon.make_notification(
                 "Error",
-                f"Failed to retrieve direct download links for {self.anime_details.sanitised_title}. Open Animepahe/Kwik in your browser and complete verification, then retry.",
+                f"Failed to retrieve direct download links for {self.anime_details.sanitised_title}. Ensure Playwright + Chromium are installed, then open Animepahe/Kwik and complete verification before retrying.",
                 False,
                 None,
             )

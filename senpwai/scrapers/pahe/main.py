@@ -1,5 +1,6 @@
 import re
 import math
+import importlib.util
 from typing import Any, Callable, NamedTuple, cast
 from requests import Response
 from bs4 import BeautifulSoup, Tag
@@ -30,6 +31,10 @@ from senpwai.scrapers.pahe.constants import (
 
 FIRST_REQUEST = True
 COOKIES = {"__ddg1_": "", "__ddg2_": ""}
+
+
+def _playwright_is_available() -> bool:
+    return importlib.util.find_spec("playwright.sync_api") is not None
 
 
 def _refresh_pahe_cookies_with_browser(url: str) -> bool:
@@ -469,7 +474,7 @@ class GetDirectDownloadLinks(ProgressFunction):
                 return []
             if progress_update_callback:
                 progress_update_callback(1)
-        if unresolved_kwik_links:
+        if unresolved_kwik_links and _playwright_is_available():
             browser_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
             direct_download_links.extend(
                 browser_resolved[link]
