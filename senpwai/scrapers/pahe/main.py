@@ -1,5 +1,6 @@
 import re
 import math
+import importlib.util
 from typing import Any, Callable, NamedTuple, cast
 from requests import Response
 from bs4 import BeautifulSoup, Tag
@@ -30,6 +31,40 @@ from senpwai.scrapers.pahe.constants import (
 
 FIRST_REQUEST = True
 COOKIES = {"__ddg1_": "", "__ddg2_": ""}
+
+
+def _playwright_is_available() -> bool:
+    try:
+        return importlib.util.find_spec("playwright.sync_api") is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def _refresh_pahe_cookies_with_browser(url: str) -> bool:
+    """Use a real browser session to refresh Animepahe cookies after manual verification."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return False
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_timeout(8000)
+        cookies = context.cookies()
+        browser.close()
+
+    pahe_cookies = {
+        cookie["name"]: cookie["value"]
+        for cookie in cookies
+        if "animepahe" in cookie.get("domain", "")
+    }
+    if not pahe_cookies:
+        return False
+    COOKIES.update(pahe_cookies)
+    return True
 """
 For some reason these cookies just need to be set as in they don't even need to be valid
 If something crashes, try updating to something like: 
@@ -65,6 +100,11 @@ def site_request(url: str, allow_redirects=False) -> Response:
         global PAHE_HOME_URL
         PAHE_HOME_URL = get_new_home_url_from_readme(FULL_SITE_NAME)
         return site_request(url)
+    if response.status_code in (403, 503):
+        refreshed = _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
+        if refreshed:
+            response = CLIENT.get(url, cookies=COOKIES, allow_redirects=allow_redirects)
+            COOKIES.update(response.cookies)
     return response
 
 
@@ -314,6 +354,74 @@ def decrypt_post_form(full_key: str, key: str, v1: int, v2: int) -> str:
     return r
 
 
+
+
+def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, str]:
+    """Resolve Kwik links using one persistent browser session and network capture."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return {}
+
+    resolved: dict[str, str] = {}
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+
+        for kwik_page_link in kwik_page_links:
+            network_candidates: list[str] = []
+
+            def capture_response(response):
+                url = response.url
+                if "kwik" in url:
+                    return
+                headers = response.headers
+                content_disposition = headers.get("content-disposition", "")
+                content_type = headers.get("content-type", "")
+                if (
+                    "attachment" in content_disposition.lower()
+                    or "video" in content_type.lower()
+                    or "octet-stream" in content_type.lower()
+                ):
+                    network_candidates.append(url)
+
+            context.on("response", capture_response)
+            page.goto(kwik_page_link, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            submit_selectors = [
+                "form button[type='submit']",
+                "button[type='submit']",
+                "form input[type='submit']",
+                "a#downloadButton",
+            ]
+            for selector in submit_selectors:
+                element = page.query_selector(selector)
+                if not element:
+                    continue
+                try:
+                    with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                        element.click()
+                except Exception:
+                    element.click()
+                page.wait_for_timeout(5000)
+                break
+
+            popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
+            if network_candidates:
+                resolved[kwik_page_link] = network_candidates[-1]
+            elif popup_urls:
+                resolved[kwik_page_link] = popup_urls[-1]
+            elif page.url != kwik_page_link and "kwik" not in page.url:
+                resolved[kwik_page_link] = page.url
+
+            context.remove_listener("response", capture_response)
+
+        browser.close()
+    return resolved
+
+
 class GetDirectDownloadLinks(ProgressFunction):
     def __init__(self) -> None:
         super().__init__()
@@ -324,22 +432,33 @@ class GetDirectDownloadLinks(ProgressFunction):
         progress_update_callback: Callable[[int], None] | None = None,
     ) -> list[str]:
         direct_download_links: list[str] = []
+        _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
+        unresolved_kwik_links: list[str] = []
         for pahewin_link in pahewin_download_page_links:
             # Extract kwik page links
             pahewin_html_page = CLIENT.get(pahewin_link).text
-            kwik_page_link = cast(
-                re.Match[str], KWIK_PAGE_REGEX.search(pahewin_html_page)
-            ).group()
+            kwik_match = KWIK_PAGE_REGEX.search(pahewin_html_page)
+            if not kwik_match:
+                self.resume.wait()
+                if self.cancelled:
+                    return []
+                if progress_update_callback:
+                    progress_update_callback(1)
+                continue
+            kwik_page_link = kwik_match.group()
 
             # Extract direct download links from kwik html page
             response = CLIENT.get(kwik_page_link)
-            match = cast(re.Match, PARAM_REGEX.search(response.text))
-            full_key, key, v1, v2 = (
-                match.group(1),
-                match.group(2),
-                match.group(3),
-                match.group(4),
-            )
+            match = PARAM_REGEX.search(response.text)
+            if not match:
+                unresolved_kwik_links.append(kwik_page_link)
+                self.resume.wait()
+                if self.cancelled:
+                    return []
+                if progress_update_callback:
+                    progress_update_callback(1)
+                continue
+            full_key, key, v1, v2 = match.group(1), match.group(2), match.group(3), match.group(4)
             form = decrypt_post_form(full_key, key, int(v1), int(v2))
             soup = BeautifulSoup(form, PARSER)
             post_url = cast(str, cast(Tag, soup.form)["action"])
@@ -351,13 +470,23 @@ class GetDirectDownloadLinks(ProgressFunction):
                 data={"_token": token_value},
                 allow_redirects=False,
             )
-            direct_download_link = response.headers["Location"]
-            direct_download_links.append(direct_download_link)
+            direct_download_link = response.headers.get("Location")
+            if not direct_download_link:
+                unresolved_kwik_links.append(kwik_page_link)
+            else:
+                direct_download_links.append(direct_download_link)
             self.resume.wait()
             if self.cancelled:
                 return []
             if progress_update_callback:
                 progress_update_callback(1)
+        if unresolved_kwik_links and _playwright_is_available():
+            browser_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
+            direct_download_links.extend(
+                browser_resolved[link]
+                for link in unresolved_kwik_links
+                if link in browser_resolved
+            )
         return direct_download_links
 
 
