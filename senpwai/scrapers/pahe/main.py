@@ -348,50 +348,69 @@ def decrypt_post_form(full_key: str, key: str, v1: int, v2: int) -> str:
 
 
 
-def _get_direct_link_with_browser(kwik_page_link: str) -> str | None:
-    """Fallback: use a real browser flow to resolve Kwik redirect links."""
+def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, str]:
+    """Resolve Kwik links using one persistent browser session and network capture."""
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
-        return None
+        return {}
 
+    resolved: dict[str, str] = {}
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
-        page.goto(kwik_page_link, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
 
-        submit_selectors = [
-            "form button[type='submit']",
-            "button[type='submit']",
-            "form input[type='submit']",
-            "a#downloadButton",
-        ]
-        candidate = None
-        download_anchor = page.query_selector("a[href^='http']")
-        if download_anchor:
-            candidate = download_anchor.get_attribute("href")
+        for kwik_page_link in kwik_page_links:
+            network_candidates: list[str] = []
 
-        for selector in submit_selectors:
-            element = page.query_selector(selector)
-            if not element:
-                continue
-            try:
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+            def capture_response(response):
+                url = response.url
+                if "kwik" in url:
+                    return
+                headers = response.headers
+                content_disposition = headers.get("content-disposition", "")
+                content_type = headers.get("content-type", "")
+                if (
+                    "attachment" in content_disposition.lower()
+                    or "video" in content_type.lower()
+                    or "octet-stream" in content_type.lower()
+                ):
+                    network_candidates.append(url)
+
+            page.on("response", capture_response)
+            page.goto(kwik_page_link, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            submit_selectors = [
+                "form button[type='submit']",
+                "button[type='submit']",
+                "form input[type='submit']",
+                "a#downloadButton",
+            ]
+            for selector in submit_selectors:
+                element = page.query_selector(selector)
+                if not element:
+                    continue
+                try:
+                    with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                        element.click()
+                except Exception:
                     element.click()
-            except Exception:
-                element.click()
-                page.wait_for_timeout(4000)
-            break
-        current_url = page.url
-        browser.close()
+                page.wait_for_timeout(5000)
+                break
 
-    if current_url != kwik_page_link:
-        return current_url
-    if candidate and "kwik" not in candidate:
-        return candidate
-    return None
+            if network_candidates:
+                resolved[kwik_page_link] = network_candidates[-1]
+            elif page.url != kwik_page_link and "kwik" not in page.url:
+                resolved[kwik_page_link] = page.url
+
+            page.remove_listener("response", capture_response)
+
+        browser.close()
+    return resolved
+
+
 class GetDirectDownloadLinks(ProgressFunction):
     def __init__(self) -> None:
         super().__init__()
@@ -403,6 +422,7 @@ class GetDirectDownloadLinks(ProgressFunction):
     ) -> list[str]:
         direct_download_links: list[str] = []
         _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
+        unresolved_kwik_links: list[str] = []
         for pahewin_link in pahewin_download_page_links:
             # Extract kwik page links
             pahewin_html_page = CLIENT.get(pahewin_link).text
@@ -420,9 +440,7 @@ class GetDirectDownloadLinks(ProgressFunction):
             response = CLIENT.get(kwik_page_link)
             match = PARAM_REGEX.search(response.text)
             if not match:
-                browser_resolved_link = _get_direct_link_with_browser(kwik_page_link)
-                if browser_resolved_link:
-                    direct_download_links.append(browser_resolved_link)
+                unresolved_kwik_links.append(kwik_page_link)
                 self.resume.wait()
                 if self.cancelled:
                     return []
@@ -443,9 +461,7 @@ class GetDirectDownloadLinks(ProgressFunction):
             )
             direct_download_link = response.headers.get("Location")
             if not direct_download_link:
-                browser_resolved_link = _get_direct_link_with_browser(kwik_page_link)
-                if browser_resolved_link:
-                    direct_download_links.append(browser_resolved_link)
+                unresolved_kwik_links.append(kwik_page_link)
             else:
                 direct_download_links.append(direct_download_link)
             self.resume.wait()
@@ -453,6 +469,13 @@ class GetDirectDownloadLinks(ProgressFunction):
                 return []
             if progress_update_callback:
                 progress_update_callback(1)
+        if unresolved_kwik_links:
+            browser_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
+            direct_download_links.extend(
+                browser_resolved[link]
+                for link in unresolved_kwik_links
+                if link in browser_resolved
+            )
         return direct_download_links
 
 
