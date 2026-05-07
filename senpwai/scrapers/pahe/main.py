@@ -418,6 +418,9 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         page.wait_for_timeout(60000)
         return wait_for_challenge_to_clear(page, timeout_ms=45000)
 
+    if not kwik_page_links:
+        return {}
+
     resolved: dict[str, str] = {}
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
@@ -429,6 +432,20 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
+
+        # Warm up challenge/session once on the first link, then reuse same context.
+        warmup_link = kwik_page_links[0]
+        page.goto(warmup_link, wait_until="domcontentloaded")
+        warmup_cleared = wait_for_challenge_to_clear(page)
+        if not warmup_cleared:
+            has_challenge_frame = page.query_selector(
+                "iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']"
+            )
+            if has_challenge_frame:
+                warmup_cleared = wait_for_manual_verification(page)
+        if not warmup_cleared:
+            browser.close()
+            return {}
 
         for kwik_page_link in kwik_page_links:
             network_candidates: list[str] = []
@@ -446,23 +463,8 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                     network_candidates.append(url)
 
             context.on("response", capture_response)
-            challenge_cleared = False
-            for _ in range(2):
-                page.goto(kwik_page_link, wait_until="domcontentloaded")
-                challenge_cleared = wait_for_challenge_to_clear(page)
-                if challenge_cleared:
-                    break
-                page.wait_for_timeout(8000)
-            if not challenge_cleared:
-                has_challenge_frame = page.query_selector(
-                    "iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']"
-                )
-                challenge_cleared = (
-                    wait_for_manual_verification(page) if has_challenge_frame else False
-                )
-                if not challenge_cleared:
-                    context.remove_listener("response", capture_response)
-                    continue
+            page.goto(kwik_page_link, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
 
             submit_selectors = [
                 "form button[type='submit']",
@@ -470,12 +472,6 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 "form input[type='submit']",
                 "a#downloadButton",
             ]
-            has_challenge_frame = page.query_selector(
-                "iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']"
-            )
-            if has_challenge_frame:
-                context.remove_listener("response", capture_response)
-                continue
             for selector in submit_selectors:
                 element = page.query_selector(selector)
                 if not element:
@@ -503,7 +499,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                             element.click()
                     except Exception:
                         element.click()
-                wait_for_challenge_to_clear(page, timeout_ms=45000)
+                page.wait_for_timeout(1000)
                 break
 
             popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
