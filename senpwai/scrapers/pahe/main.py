@@ -438,11 +438,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         page.goto(warmup_link, wait_until="domcontentloaded")
         warmup_cleared = wait_for_challenge_to_clear(page)
         if not warmup_cleared:
-            has_challenge_frame = page.query_selector(
-                "iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']"
-            )
-            if has_challenge_frame:
-                warmup_cleared = wait_for_manual_verification(page)
+            warmup_cleared = wait_for_manual_verification(page)
         if not warmup_cleared:
             browser.close()
             return {}
@@ -544,6 +540,7 @@ class GetDirectDownloadLinks(ProgressFunction):
         direct_download_links: list[str] = []
         _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
         unresolved_kwik_links: list[str] = []
+        unresolved_progress_pending = 0
         for pahewin_link in pahewin_download_page_links:
             # Extract kwik page links
             pahewin_html_page = CLIENT.get(pahewin_link).text
@@ -562,11 +559,7 @@ class GetDirectDownloadLinks(ProgressFunction):
             match = PARAM_REGEX.search(response.text)
             if not match:
                 unresolved_kwik_links.append(kwik_page_link)
-                self.resume.wait()
-                if self.cancelled:
-                    return []
-                if progress_update_callback:
-                    progress_update_callback(1)
+                unresolved_progress_pending += 1
                 continue
             full_key, key, v1, v2 = match.group(1), match.group(2), match.group(3), match.group(4)
             form = decrypt_post_form(full_key, key, int(v1), int(v2))
@@ -583,13 +576,14 @@ class GetDirectDownloadLinks(ProgressFunction):
             direct_download_link = response.headers.get("Location")
             if not direct_download_link:
                 unresolved_kwik_links.append(kwik_page_link)
+                unresolved_progress_pending += 1
             else:
                 direct_download_links.append(direct_download_link)
-            self.resume.wait()
-            if self.cancelled:
-                return []
-            if progress_update_callback:
-                progress_update_callback(1)
+                self.resume.wait()
+                if self.cancelled:
+                    return []
+                if progress_update_callback:
+                    progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
             browser_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
             direct_download_links.extend(
@@ -597,6 +591,21 @@ class GetDirectDownloadLinks(ProgressFunction):
                 for link in unresolved_kwik_links
                 if link in browser_resolved
             )
+            resolved_count = len(browser_resolved)
+            for _ in range(resolved_count):
+                self.resume.wait()
+                if self.cancelled:
+                    return []
+                if progress_update_callback:
+                    progress_update_callback(1)
+            unresolved_progress_pending -= resolved_count
+        # For links that remained unresolved even after browser fallback, still move progress.
+        for _ in range(max(unresolved_progress_pending, 0)):
+            self.resume.wait()
+            if self.cancelled:
+                return []
+            if progress_update_callback:
+                progress_update_callback(1)
         return direct_download_links
 
 
