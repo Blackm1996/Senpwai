@@ -2,6 +2,7 @@ import re
 import math
 import importlib.util
 from typing import Any, Callable, NamedTuple, cast
+from requests.cookies import RequestsCookieJar
 from requests import Response
 from bs4 import BeautifulSoup, Tag
 from senpwai.common.scraper import (
@@ -31,6 +32,7 @@ from senpwai.scrapers.pahe.constants import (
 
 FIRST_REQUEST = True
 COOKIES = {"__ddg1_": "", "__ddg2_": ""}
+KWIK_SESSION_COOKIES = RequestsCookieJar()
 
 
 def _playwright_is_available() -> bool:
@@ -48,9 +50,17 @@ def _refresh_pahe_cookies_with_browser(url: str) -> bool:
         return False
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        browser = playwright.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         context = browser.new_context()
         page = context.new_page()
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
         page.goto(url, wait_until="domcontentloaded")
         page.wait_for_timeout(8000)
         cookies = context.cookies()
@@ -363,19 +373,68 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
     except Exception:
         return {}
 
+    def wait_for_challenge_to_clear(page, timeout_ms: int = 120000) -> bool:
+        challenge_indicators = (
+            "just a moment",
+            "verify you are human",
+            "checking your browser",
+            "cf-challenge",
+            "cloudflare",
+        )
+        page.wait_for_timeout(1500)
+        try:
+            page.wait_for_function(
+                """
+                (indicators) => {
+                    const text = (document.body?.innerText || '').toLowerCase();
+                    const hasChallengeText = indicators.some((indicator) => text.includes(indicator));
+                    const challengeFrame = !!document.querySelector("iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']");
+                    return !hasChallengeText && !challengeFrame;
+                }
+                """,
+                challenge_indicators,
+                timeout=timeout_ms,
+            )
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                # Download/stream pages often never reach networkidle; challenge can still be done.
+                pass
+            page.wait_for_timeout(1000)
+            return True
+        except Exception:
+            return False
+
+    def wait_for_manual_verification(page) -> bool:
+        """
+        Keep the browser open long enough for a user to manually complete
+        captcha/checkbox challenges, then re-check challenge state.
+        """
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        # Give enough time for manual checkbox completion without stalling indefinitely.
+        page.wait_for_timeout(60000)
+        return wait_for_challenge_to_clear(page, timeout_ms=45000)
+
     resolved: dict[str, str] = {}
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        browser = playwright.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         context = browser.new_context()
         page = context.new_page()
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
 
         for kwik_page_link in kwik_page_links:
             network_candidates: list[str] = []
 
             def capture_response(response):
                 url = response.url
-                if "kwik" in url:
-                    return
                 headers = response.headers
                 content_disposition = headers.get("content-disposition", "")
                 content_type = headers.get("content-type", "")
@@ -387,8 +446,23 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                     network_candidates.append(url)
 
             context.on("response", capture_response)
-            page.goto(kwik_page_link, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
+            challenge_cleared = False
+            for _ in range(2):
+                page.goto(kwik_page_link, wait_until="domcontentloaded")
+                challenge_cleared = wait_for_challenge_to_clear(page)
+                if challenge_cleared:
+                    break
+                page.wait_for_timeout(8000)
+            if not challenge_cleared:
+                has_challenge_frame = page.query_selector(
+                    "iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']"
+                )
+                challenge_cleared = (
+                    wait_for_manual_verification(page) if has_challenge_frame else False
+                )
+                if not challenge_cleared:
+                    context.remove_listener("response", capture_response)
+                    continue
 
             submit_selectors = [
                 "form button[type='submit']",
@@ -396,16 +470,40 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 "form input[type='submit']",
                 "a#downloadButton",
             ]
+            has_challenge_frame = page.query_selector(
+                "iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']"
+            )
+            if has_challenge_frame:
+                context.remove_listener("response", capture_response)
+                continue
             for selector in submit_selectors:
                 element = page.query_selector(selector)
                 if not element:
                     continue
                 try:
-                    with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    with page.expect_response(
+                        lambda response: (
+                            "attachment"
+                            in response.headers.get("content-disposition", "").lower()
+                        )
+                        or ("video" in response.headers.get("content-type", "").lower())
+                        or (
+                            "octet-stream"
+                            in response.headers.get("content-type", "").lower()
+                        ),
+                        timeout=45000,
+                    ) as download_response:
                         element.click()
+                    network_candidates.append(download_response.value.url)
                 except Exception:
-                    element.click()
-                page.wait_for_timeout(5000)
+                    try:
+                        with page.expect_navigation(
+                            wait_until="domcontentloaded", timeout=15000
+                        ):
+                            element.click()
+                    except Exception:
+                        element.click()
+                wait_for_challenge_to_clear(page, timeout_ms=45000)
                 break
 
             popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
@@ -413,13 +511,29 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 resolved[kwik_page_link] = network_candidates[-1]
             elif popup_urls:
                 resolved[kwik_page_link] = popup_urls[-1]
-            elif page.url != kwik_page_link and "kwik" not in page.url:
+            elif page.url != kwik_page_link:
                 resolved[kwik_page_link] = page.url
 
             context.remove_listener("response", capture_response)
 
         browser.close()
+    global KWIK_SESSION_COOKIES
+    KWIK_SESSION_COOKIES = RequestsCookieJar()
+    for cookie in context.cookies():
+        domain = cookie.get("domain", "")
+        if "kwik" not in domain and "pahe" not in domain:
+            continue
+        KWIK_SESSION_COOKIES.set(
+            cookie["name"],
+            cookie["value"],
+            domain=domain,
+            path=cookie.get("path", "/"),
+        )
     return resolved
+
+
+def get_kwik_session_cookies() -> RequestsCookieJar:
+    return KWIK_SESSION_COOKIES.copy()
 
 
 class GetDirectDownloadLinks(ProgressFunction):

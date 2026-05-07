@@ -8,6 +8,7 @@ from queue import Queue
 import random
 from threading import Event, Lock, Thread
 from typing import Callable, cast
+from requests.cookies import RequestsCookieJar
 
 from senpwai.common.tracker import check_tracked_anime
 from tqdm import tqdm
@@ -457,6 +458,9 @@ def download_thread(
     max_part_size = get_max_part_size(
         download_size, anime_details.site, is_hls_download
     )
+    cookies = RequestsCookieJar()
+    if anime_details.site == PAHE and not is_hls_download:
+        cookies = pahe.get_kwik_session_cookies()
     download = Download(
         link_or_segs_urls,
         episode_title,
@@ -464,6 +468,7 @@ def download_thread(
         download_size,
         pbar.update_,
         is_hls_download=is_hls_download,
+        cookies=cookies,
         max_part_size=max_part_size,
     )
     download.start_download()

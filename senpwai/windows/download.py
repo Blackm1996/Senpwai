@@ -2,6 +2,7 @@ import os
 from threading import Event
 import time
 from typing import Callable, cast, TYPE_CHECKING
+from requests.cookies import RequestsCookieJar
 from PyQt6.QtCore import QMutex, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -885,6 +886,9 @@ class DownloadThread(QThread):
         max_part_size = get_max_part_size(
             self.download_size, self.site, self.is_hls_download
         )
+        cookies = RequestsCookieJar()
+        if self.site == PAHE and not self.is_hls_download:
+            cookies = pahe.get_kwik_session_cookies()
         self.download = Download(
             self.ddl_or_seg_urls,
             self.title,
@@ -892,6 +896,7 @@ class DownloadThread(QThread):
             self.download_size,
             lambda x: self.update_bars.emit(x),
             is_hls_download=self.is_hls_download,
+            cookies=cookies,
             max_part_size=max_part_size,
         )
         self.progress_bar.pause_callback = self.download.pause_or_resume
