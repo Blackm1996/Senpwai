@@ -472,6 +472,19 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 element = page.query_selector(selector)
                 if not element:
                     continue
+                element_href = element.get_attribute("href")
+                if element_href and element_href.startswith("http"):
+                    network_candidates.append(element_href)
+                    break
+                try:
+                    form_action = page.eval_on_selector(
+                        "form", "form => form?.action || ''"
+                    )
+                    if isinstance(form_action, str) and form_action.startswith("http"):
+                        network_candidates.append(form_action)
+                        break
+                except Exception:
+                    pass
                 try:
                     with page.expect_response(
                         lambda response: (
@@ -483,7 +496,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                             "octet-stream"
                             in response.headers.get("content-type", "").lower()
                         ),
-                        timeout=45000,
+                        timeout=10000,
                     ) as download_response:
                         element.click()
                     network_candidates.append(download_response.value.url)
