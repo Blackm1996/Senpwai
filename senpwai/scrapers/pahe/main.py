@@ -541,6 +541,32 @@ def get_kwik_session_cookies() -> RequestsCookieJar:
     return KWIK_SESSION_COOKIES.copy()
 
 
+def _retry_kwik_links_with_session(kwik_page_links: list[str]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    kwik_cookies = get_kwik_session_cookies()
+    for kwik_page_link in kwik_page_links:
+        response = CLIENT.get(kwik_page_link, cookies=kwik_cookies)
+        match = PARAM_REGEX.search(response.text)
+        if not match:
+            continue
+        full_key, key, v1, v2 = match.group(1), match.group(2), match.group(3), match.group(4)
+        form = decrypt_post_form(full_key, key, int(v1), int(v2))
+        soup = BeautifulSoup(form, PARSER)
+        post_url = cast(str, cast(Tag, soup.form)["action"])
+        token_value = cast(str, cast(Tag, soup.input)["value"])
+        post_response = CLIENT.post(
+            post_url,
+            headers=CLIENT.make_headers({"Referer": kwik_page_link}),
+            cookies=kwik_cookies,
+            data={"_token": token_value},
+            allow_redirects=False,
+        )
+        direct_download_link = post_response.headers.get("Location")
+        if direct_download_link:
+            resolved[kwik_page_link] = direct_download_link
+    return resolved
+
+
 class GetDirectDownloadLinks(ProgressFunction):
     def __init__(self) -> None:
         super().__init__()
@@ -598,7 +624,9 @@ class GetDirectDownloadLinks(ProgressFunction):
                 if progress_update_callback:
                     progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
-            browser_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
+            # Warm up challenge/session once on first link, then close browser and retry normally.
+            _resolve_direct_links_with_browser([unresolved_kwik_links[0]])
+            browser_resolved = _retry_kwik_links_with_session(unresolved_kwik_links)
             direct_download_links.extend(
                 browser_resolved[link]
                 for link in unresolved_kwik_links
