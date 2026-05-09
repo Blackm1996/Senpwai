@@ -38,7 +38,7 @@ COOKIES = {"__ddg1_": "", "__ddg2_": ""}
 KWIK_SESSION_COOKIES = RequestsCookieJar()
 
 
-PAHE_DEBUG_LOG_PATH = os.environ.get("SENPWAI_PAHE_DEBUG_LOG", "/tmp/senpwai_pahe_debug.log")
+PAHE_DEBUG_LOG_PATH = os.environ.get("SENPWAI_PAHE_DEBUG_LOG", r"D:\Blackm\Documents\senpwai_pahe_debug.log")
 
 
 def _pahe_debug(event: str, **data: Any) -> None:
@@ -539,16 +539,16 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 if not element:
                     continue
                 element_href = element.get_attribute("href")
+                href_candidate: str | None = None
                 if element_href and element_href.startswith("http"):
+                    href_candidate = element_href
                     network_candidates.append(element_href)
-                    break
                 try:
                     form_action = page.eval_on_selector(
                         "form", "form => form?.action || ''"
                     )
                     if isinstance(form_action, str) and form_action.startswith("http"):
                         network_candidates.append(form_action)
-                        break
                 except Exception:
                     pass
                 try:
@@ -575,6 +575,8 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                     except Exception:
                         element.click()
                 page.wait_for_timeout(1000)
+                if href_candidate and "/d/" not in href_candidate:
+                    break
                 break
 
             popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
@@ -660,6 +662,22 @@ def _upgrade_kwik_download_url(download_url: str, referer_url: str) -> str:
         )
         if location and location.startswith("http"):
             return location
+        if response.status_code == 405:
+            follow_response = CLIENT.get(
+                download_url,
+                headers=CLIENT.make_headers({"Referer": referer_url}),
+                cookies=kwik_cookies,
+                allow_redirects=True,
+            )
+            _pahe_debug(
+                "kwik_download_upgrade_follow",
+                referer_url=referer_url,
+                download_url=download_url,
+                final_url=follow_response.url,
+                status_code=follow_response.status_code,
+            )
+            if follow_response.url and follow_response.url != download_url:
+                return follow_response.url
     except Exception as exc:
         _pahe_debug(
             "kwik_download_upgrade_error",
