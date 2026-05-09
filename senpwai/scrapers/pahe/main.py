@@ -467,6 +467,30 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         _pahe_debug("browser_candidate_ranked", ranked=ranked)
         return ranked[0]
 
+    def pick_candidate_with_length(candidates: list[str], referer_url: str) -> str | None:
+        ranked = sorted(candidates, key=lambda u: (u == pick_best_candidate(candidates)), reverse=True)
+        for candidate in ranked:
+            try:
+                response = CLIENT.get(
+                    candidate,
+                    headers=CLIENT.make_headers({"Referer": referer_url}),
+                    cookies=get_kwik_session_cookies(),
+                    allow_redirects=True,
+                )
+                content_length = response.headers.get("Content-Length")
+                _pahe_debug(
+                    "browser_candidate_length_probe",
+                    candidate=candidate,
+                    final_url=response.url,
+                    status_code=response.status_code,
+                    content_length=content_length,
+                )
+                if content_length and str(content_length).isdigit() and int(content_length) > 0:
+                    return response.url or candidate
+            except Exception as exc:
+                _pahe_debug("browser_candidate_length_probe_error", candidate=candidate, error=str(exc))
+        return pick_best_candidate(candidates)
+
     def wait_for_challenge_to_clear(page, timeout_ms: int = 120000) -> bool:
         elapsed = 0
         step_ms = 2000
@@ -604,7 +628,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
 
             popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
             if network_candidates:
-                best_candidate = pick_best_candidate(network_candidates)
+                best_candidate = pick_candidate_with_length(network_candidates, kwik_page_link)
                 if best_candidate:
                     resolved[kwik_page_link] = best_candidate
                 _pahe_debug("browser_link_resolved_network", kwik_page_link=kwik_page_link, resolved_url=resolved.get(kwik_page_link), candidates=network_candidates)
