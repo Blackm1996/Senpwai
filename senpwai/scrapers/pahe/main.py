@@ -476,6 +476,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                     headers=CLIENT.make_headers({"Referer": referer_url}),
                     cookies=get_kwik_session_cookies(),
                     allow_redirects=True,
+                    stream=True,
                 )
                 content_length = response.headers.get("Content-Length")
                 _pahe_debug(
@@ -486,7 +487,9 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                     content_length=content_length,
                 )
                 if content_length and str(content_length).isdigit() and int(content_length) > 0:
+                    response.close()
                     return response.url or candidate
+                response.close()
             except Exception as exc:
                 _pahe_debug("browser_candidate_length_probe_error", candidate=candidate, error=str(exc))
         return pick_best_candidate(candidates)
@@ -598,29 +601,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                         network_candidates.append(form_action)
                 except Exception:
                     pass
-                try:
-                    with page.expect_response(
-                        lambda response: (
-                            "attachment"
-                            in response.headers.get("content-disposition", "").lower()
-                        )
-                        or ("video" in response.headers.get("content-type", "").lower())
-                        or (
-                            "octet-stream"
-                            in response.headers.get("content-type", "").lower()
-                        ),
-                        timeout=10000,
-                    ) as download_response:
-                        element.click()
-                    network_candidates.append(download_response.value.url)
-                except Exception:
-                    try:
-                        with page.expect_navigation(
-                            wait_until="domcontentloaded", timeout=15000
-                        ):
-                            element.click()
-                    except Exception:
-                        element.click()
+                # Do not click download actions in browser warmup path.
                 page.wait_for_timeout(1000)
                 if href_candidate and "/d/" not in href_candidate:
                     break
