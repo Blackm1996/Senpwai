@@ -639,6 +639,37 @@ def _retry_kwik_links_with_session(kwik_page_links: list[str]) -> dict[str, str]
     return resolved
 
 
+def _upgrade_kwik_download_url(download_url: str, referer_url: str) -> str:
+    if "kwik.cx/d/" not in download_url:
+        return download_url
+    try:
+        kwik_cookies = get_kwik_session_cookies()
+        response = CLIENT.get(
+            download_url,
+            headers=CLIENT.make_headers({"Referer": referer_url}),
+            cookies=kwik_cookies,
+            allow_redirects=False,
+        )
+        location = response.headers.get("Location")
+        _pahe_debug(
+            "kwik_download_upgrade_attempt",
+            referer_url=referer_url,
+            download_url=download_url,
+            status_code=response.status_code,
+            location=location,
+        )
+        if location and location.startswith("http"):
+            return location
+    except Exception as exc:
+        _pahe_debug(
+            "kwik_download_upgrade_error",
+            referer_url=referer_url,
+            download_url=download_url,
+            error=str(exc),
+        )
+    return download_url
+
+
 class GetDirectDownloadLinks(ProgressFunction):
     def __init__(self) -> None:
         super().__init__()
@@ -712,7 +743,7 @@ class GetDirectDownloadLinks(ProgressFunction):
                 browser_resolved.update(_retry_kwik_links_with_session(remaining))
             _pahe_debug("fallback_resolution_summary", unresolved_count=len(unresolved_kwik_links), browser_direct_count=len(browser_resolved), final_resolved_count=len(browser_resolved))
             direct_download_links.extend(
-                browser_resolved[link]
+                _upgrade_kwik_download_url(browser_resolved[link], link)
                 for link in unresolved_kwik_links
                 if link in browser_resolved
             )
