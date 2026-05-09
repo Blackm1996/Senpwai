@@ -1,6 +1,9 @@
 import re
+import os
+import json
 import math
 import importlib.util
+from datetime import datetime, timezone
 from typing import Any, Callable, NamedTuple, cast
 from requests.cookies import RequestsCookieJar
 from requests import Response
@@ -35,18 +38,56 @@ COOKIES = {"__ddg1_": "", "__ddg2_": ""}
 KWIK_SESSION_COOKIES = RequestsCookieJar()
 
 
+PAHE_DEBUG_LOG_PATH = os.environ.get("SENPWAI_PAHE_DEBUG_LOG", "/tmp/senpwai_pahe_debug.log")
+
+
+def _pahe_debug(event: str, **data: Any) -> None:
+    try:
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **data,
+        }
+        with open(PAHE_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _cookie_snapshot(jar_or_dict: Any) -> list[dict[str, Any]]:
+    snapshot: list[dict[str, Any]] = []
+    if isinstance(jar_or_dict, dict):
+        for name, value in jar_or_dict.items():
+            snapshot.append({"name": name, "value_len": len(str(value))})
+        return snapshot
+    for cookie in jar_or_dict:
+        snapshot.append({
+            "name": cookie.name,
+            "domain": cookie.domain,
+            "path": cookie.path,
+            "secure": cookie.secure,
+            "expires": cookie.expires,
+            "value_len": len(cookie.value or ""),
+        })
+    return snapshot
+
+
 def _playwright_is_available() -> bool:
     try:
-        return importlib.util.find_spec("playwright.sync_api") is not None
+        available = importlib.util.find_spec("playwright.sync_api") is not None
+        _pahe_debug("playwright_available", available=available)
+        return available
     except ModuleNotFoundError:
         return False
 
 
 def _refresh_pahe_cookies_with_browser(url: str) -> bool:
     """Use a real browser session to refresh Animepahe cookies after manual verification."""
+    _pahe_debug("refresh_pahe_cookies_start", url=url)
     try:
         from playwright.sync_api import sync_playwright
-    except Exception:
+    except Exception as exc:
+        _pahe_debug("refresh_pahe_cookies_import_error", error=str(exc))
         return False
 
     with sync_playwright() as playwright:
@@ -64,6 +105,7 @@ def _refresh_pahe_cookies_with_browser(url: str) -> bool:
         page.goto(url, wait_until="domcontentloaded")
         page.wait_for_timeout(8000)
         cookies = context.cookies()
+        _pahe_debug("refresh_pahe_cookies_browser_captured", count=len(cookies), cookies=cookies)
         browser.close()
 
     pahe_cookies = {
@@ -72,8 +114,10 @@ def _refresh_pahe_cookies_with_browser(url: str) -> bool:
         if "animepahe" in cookie.get("domain", "")
     }
     if not pahe_cookies:
+        _pahe_debug("refresh_pahe_cookies_empty")
         return False
     COOKIES.update(pahe_cookies)
+    _pahe_debug("refresh_pahe_cookies_done", cookies=_cookie_snapshot(COOKIES))
     return True
 """
 For some reason these cookies just need to be set as in they don't even need to be valid
@@ -91,6 +135,7 @@ def site_request(url: str, allow_redirects=False) -> Response:
     For requests that go specifically to the domain animepahe.ru instead of e.g., pahe.win or kwik.si
     Typically these requests need the cookies
     """
+    _pahe_debug("site_request_start", url=url, allow_redirects=allow_redirects, cookies=_cookie_snapshot(COOKIES))
     try:
         # We only want to handle the domain change incase this is the first request
         # This is to avoid raising DomainNameError when the something else broke instead
@@ -106,12 +151,16 @@ def site_request(url: str, allow_redirects=False) -> Response:
         else:
             response = CLIENT.get(url, cookies=COOKIES, allow_redirects=allow_redirects)
         COOKIES.update(response.cookies)
+        _pahe_debug("site_request_response", url=url, status_code=response.status_code, response_url=response.url, set_cookie_count=len(response.cookies))
     except DomainNameError:
+        _pahe_debug("site_request_domain_change_detected", url=url)
         global PAHE_HOME_URL
         PAHE_HOME_URL = get_new_home_url_from_readme(FULL_SITE_NAME)
         return site_request(url)
     if response.status_code in (403, 503):
+        _pahe_debug("site_request_challenge_status", status_code=response.status_code, url=url)
         refreshed = _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
+        _pahe_debug("site_request_refresh_result", refreshed=refreshed)
         if refreshed:
             response = CLIENT.get(url, cookies=COOKIES, allow_redirects=allow_redirects)
             COOKIES.update(response.cookies)
@@ -367,10 +416,12 @@ def decrypt_post_form(full_key: str, key: str, v1: int, v2: int) -> str:
 
 
 def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, str]:
+    _pahe_debug("browser_resolve_start", kwik_page_links=kwik_page_links)
     """Resolve Kwik links using one persistent browser session and network capture."""
     try:
         from playwright.sync_api import sync_playwright
-    except Exception:
+    except Exception as exc:
+        _pahe_debug("browser_resolve_import_error", error=str(exc))
         return {}
 
     def wait_for_challenge_to_clear(page, timeout_ms: int = 120000) -> bool:
@@ -440,6 +491,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         if not warmup_cleared:
             warmup_cleared = wait_for_manual_verification(page)
         if not warmup_cleared:
+            _pahe_debug("browser_warmup_failed", warmup_link=warmup_link)
             browser.close()
             return {}
 
@@ -514,17 +566,22 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
             popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
             if network_candidates:
                 resolved[kwik_page_link] = network_candidates[-1]
+                _pahe_debug("browser_link_resolved_network", kwik_page_link=kwik_page_link, resolved_url=resolved[kwik_page_link], candidates=network_candidates)
             elif popup_urls:
                 resolved[kwik_page_link] = popup_urls[-1]
+                _pahe_debug("browser_link_resolved_popup", kwik_page_link=kwik_page_link, resolved_url=resolved[kwik_page_link], popup_urls=popup_urls)
             elif page.url != kwik_page_link:
                 resolved[kwik_page_link] = page.url
 
             context.remove_listener("response", capture_response)
 
+        cookies = context.cookies()
+        _pahe_debug("browser_context_cookies", count=len(cookies), cookies=cookies)
         browser.close()
     global KWIK_SESSION_COOKIES
     KWIK_SESSION_COOKIES = RequestsCookieJar()
-    for cookie in context.cookies():
+
+    for cookie in cookies:
         domain = cookie.get("domain", "")
         if "kwik" not in domain and "pahe" not in domain:
             continue
@@ -534,6 +591,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
             domain=domain,
             path=cookie.get("path", "/"),
         )
+    _pahe_debug("browser_resolve_done", resolved_count=len(resolved), resolved=resolved, kwik_session_cookies=_cookie_snapshot(KWIK_SESSION_COOKIES))
     return resolved
 
 
@@ -597,6 +655,7 @@ class GetDirectDownloadLinks(ProgressFunction):
             response = CLIENT.get(kwik_page_link)
             match = PARAM_REGEX.search(response.text)
             if not match:
+                _pahe_debug("kwik_param_regex_miss", kwik_page_link=kwik_page_link, status_code=response.status_code, response_url=response.url, text_prefix=response.text[:300])
                 unresolved_kwik_links.append(kwik_page_link)
                 unresolved_progress_pending += 1
                 continue
@@ -614,9 +673,11 @@ class GetDirectDownloadLinks(ProgressFunction):
             )
             direct_download_link = response.headers.get("Location")
             if not direct_download_link:
+                _pahe_debug("kwik_post_no_location", kwik_page_link=kwik_page_link, status_code=response.status_code, headers=dict(response.headers))
                 unresolved_kwik_links.append(kwik_page_link)
                 unresolved_progress_pending += 1
             else:
+                _pahe_debug("kwik_direct_link_resolved_normal", kwik_page_link=kwik_page_link, direct_link=direct_download_link)
                 direct_download_links.append(direct_download_link)
                 self.resume.wait()
                 if self.cancelled:
@@ -625,8 +686,12 @@ class GetDirectDownloadLinks(ProgressFunction):
                     progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
             # Warm up challenge/session once on first link, then close browser and retry normally.
-            _resolve_direct_links_with_browser([unresolved_kwik_links[0]])
-            browser_resolved = _retry_kwik_links_with_session(unresolved_kwik_links)
+            browser_resolved_direct = _resolve_direct_links_with_browser([unresolved_kwik_links[0]])
+            browser_resolved = dict(browser_resolved_direct)
+            remaining = [link for link in unresolved_kwik_links if link not in browser_resolved]
+            if remaining:
+                browser_resolved.update(_retry_kwik_links_with_session(remaining))
+            _pahe_debug("fallback_resolution_summary", unresolved_count=len(unresolved_kwik_links), browser_direct_count=len(browser_resolved_direct), final_resolved_count=len(browser_resolved))
             direct_download_links.extend(
                 browser_resolved[link]
                 for link in unresolved_kwik_links
