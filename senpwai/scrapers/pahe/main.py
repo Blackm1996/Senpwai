@@ -39,6 +39,7 @@ KWIK_SESSION_COOKIES = RequestsCookieJar()
 
 
 PAHE_DEBUG_LOG_PATH = os.environ.get("SENPWAI_PAHE_DEBUG_LOG", r"D:\Blackm\Documents\senpwai_pahe_debug.log")
+PLAYWRIGHT_HEADLESS = os.environ.get("SENPWAI_PLAYWRIGHT_HEADLESS", "1") != "0"
 
 
 def _pahe_debug(event: str, **data: Any) -> None:
@@ -92,7 +93,7 @@ def _refresh_pahe_cookies_with_browser(url: str) -> bool:
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
-            headless=False,
+            headless=PLAYWRIGHT_HEADLESS,
             args=[
                 "--disable-blink-features=AutomationControlled",
             ],
@@ -518,27 +519,13 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 return True
         return False
 
-    def wait_for_manual_verification(page) -> bool:
-        """
-        Keep the browser open long enough for a user to manually complete
-        captcha/checkbox challenges, then re-check challenge state.
-        """
-        try:
-            page.bring_to_front()
-            _pahe_debug("browser_bring_to_front_ok")
-        except Exception as exc:
-            _pahe_debug("browser_bring_to_front_fail", error=str(exc))
-        # Give enough time for manual checkbox completion without stalling indefinitely.
-        page.wait_for_timeout(60000)
-        return wait_for_challenge_to_clear(page, timeout_ms=45000)
-
     if not kwik_page_links:
         return {}
 
     resolved: dict[str, str] = {}
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
-            headless=False,
+            headless=PLAYWRIGHT_HEADLESS,
             args=["--disable-blink-features=AutomationControlled"],
         )
         context = browser.new_context()
@@ -551,8 +538,6 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         warmup_link = kwik_page_links[0]
         page.goto(warmup_link, wait_until="domcontentloaded")
         warmup_cleared = wait_for_challenge_to_clear(page)
-        if not warmup_cleared:
-            warmup_cleared = wait_for_manual_verification(page)
         if not warmup_cleared:
             probe = _probe_page_state(page)
             _pahe_debug("browser_warmup_failed", warmup_link=warmup_link, final_url=page.url, probe=probe)
@@ -778,27 +763,15 @@ class GetDirectDownloadLinks(ProgressFunction):
                 if progress_update_callback:
                     progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
-            # Use Playwright as both resolver (when possible) and session warmup.
-            browser_direct_resolved: dict[str, str] = {}
-            warmed = False
-            for idx, warmup_link in enumerate(unresolved_kwik_links):
-                browser_direct_resolved.update(_resolve_direct_links_with_browser([warmup_link]))
-                _pahe_debug(
-                    "fallback_warmup_attempt",
-                    attempt_index=idx,
-                    warmup_link=warmup_link,
-                    resolved_count=len(browser_direct_resolved),
-                )
-                if warmup_link in browser_direct_resolved:
-                    warmed = True
-                    break
+            # Resolve all unresolved links in one browser session to keep the same challenge context.
+            browser_direct_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
+            warmed = bool(browser_direct_resolved)
+            unresolved_after_browser = [
+                link for link in unresolved_kwik_links if link not in browser_direct_resolved
+            ]
             session_resolved: dict[str, str] = {}
-            if warmed:
-                unresolved_after_browser = [
-                    link for link in unresolved_kwik_links if link not in browser_direct_resolved
-                ]
-                if unresolved_after_browser:
-                    session_resolved = _retry_kwik_links_with_session(unresolved_after_browser)
+            if warmed and unresolved_after_browser:
+                session_resolved = _retry_kwik_links_with_session(unresolved_after_browser)
             browser_resolved: dict[str, str] = {**browser_direct_resolved, **session_resolved}
             _pahe_debug(
                 "fallback_resolution_summary",
@@ -806,13 +779,18 @@ class GetDirectDownloadLinks(ProgressFunction):
                 browser_direct_count=len(browser_direct_resolved),
                 final_resolved_count=len(browser_resolved),
                 warmed=warmed,
+                unresolved_after_browser=unresolved_after_browser,
             )
-            direct_download_links.extend(
-                _upgrade_kwik_download_url(browser_resolved[link], link)
-                for link in unresolved_kwik_links
-                if link in browser_resolved
-            )
-            resolved_count = len(browser_resolved)
+            resolved_count = 0
+            for link in unresolved_kwik_links:
+                if link not in browser_resolved:
+                    continue
+                upgraded = _upgrade_kwik_download_url(browser_resolved[link], link)
+                if "kwik.cx/d/" in upgraded:
+                    _pahe_debug("fallback_unverified_download_url", kwik_page_link=link, resolved_url=upgraded)
+                    continue
+                direct_download_links.append(upgraded)
+                resolved_count += 1
             for _ in range(resolved_count):
                 self.resume.wait()
                 if self.cancelled:
