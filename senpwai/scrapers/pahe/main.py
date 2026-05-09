@@ -778,18 +778,31 @@ class GetDirectDownloadLinks(ProgressFunction):
                 if progress_update_callback:
                     progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
-            # Warm up challenge/session once on first link, then close browser and retry normally.
-            browser_resolved: dict[str, str] = {}
+            # Use Playwright purely as a challenge/session warmup step.
+            # After warmup, resolve ALL unresolved links via the original
+            # HTTP decrypt/post flow using warmed session cookies.
+            warmed = False
             for idx, warmup_link in enumerate(unresolved_kwik_links):
                 browser_resolved_direct = _resolve_direct_links_with_browser([warmup_link])
-                _pahe_debug("fallback_warmup_attempt", attempt_index=idx, warmup_link=warmup_link, resolved_count=len(browser_resolved_direct))
+                _pahe_debug(
+                    "fallback_warmup_attempt",
+                    attempt_index=idx,
+                    warmup_link=warmup_link,
+                    resolved_count=len(browser_resolved_direct),
+                )
                 if browser_resolved_direct:
-                    browser_resolved.update(browser_resolved_direct)
+                    warmed = True
                     break
-            remaining = [link for link in unresolved_kwik_links if link not in browser_resolved]
-            if remaining:
-                browser_resolved.update(_retry_kwik_links_with_session(remaining))
-            _pahe_debug("fallback_resolution_summary", unresolved_count=len(unresolved_kwik_links), browser_direct_count=len(browser_resolved), final_resolved_count=len(browser_resolved))
+            browser_resolved: dict[str, str] = {}
+            if warmed:
+                browser_resolved = _retry_kwik_links_with_session(unresolved_kwik_links)
+            _pahe_debug(
+                "fallback_resolution_summary",
+                unresolved_count=len(unresolved_kwik_links),
+                browser_direct_count=0,
+                final_resolved_count=len(browser_resolved),
+                warmed=warmed,
+            )
             direct_download_links.extend(
                 _upgrade_kwik_download_url(browser_resolved[link], link)
                 for link in unresolved_kwik_links

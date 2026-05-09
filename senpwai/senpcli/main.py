@@ -77,7 +77,7 @@ ANIME_REFERENCES = (
     "Wonder of Ohio",
     "Omoshire ore ga zangetsu da",
     "Getsuga Tenshou",
-    "Rasenghan",
+    "Rasengan",
     "Za Warudo",
     "Star Pratina",
     "Nigurendayooo",
