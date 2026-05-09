@@ -778,28 +778,32 @@ class GetDirectDownloadLinks(ProgressFunction):
                 if progress_update_callback:
                     progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
-            # Use Playwright purely as a challenge/session warmup step.
-            # After warmup, resolve ALL unresolved links via the original
-            # HTTP decrypt/post flow using warmed session cookies.
+            # Use Playwright as both resolver (when possible) and session warmup.
+            browser_direct_resolved: dict[str, str] = {}
             warmed = False
             for idx, warmup_link in enumerate(unresolved_kwik_links):
-                browser_resolved_direct = _resolve_direct_links_with_browser([warmup_link])
+                browser_direct_resolved.update(_resolve_direct_links_with_browser([warmup_link]))
                 _pahe_debug(
                     "fallback_warmup_attempt",
                     attempt_index=idx,
                     warmup_link=warmup_link,
-                    resolved_count=len(browser_resolved_direct),
+                    resolved_count=len(browser_direct_resolved),
                 )
-                if browser_resolved_direct:
+                if warmup_link in browser_direct_resolved:
                     warmed = True
                     break
-            browser_resolved: dict[str, str] = {}
+            session_resolved: dict[str, str] = {}
             if warmed:
-                browser_resolved = _retry_kwik_links_with_session(unresolved_kwik_links)
+                unresolved_after_browser = [
+                    link for link in unresolved_kwik_links if link not in browser_direct_resolved
+                ]
+                if unresolved_after_browser:
+                    session_resolved = _retry_kwik_links_with_session(unresolved_after_browser)
+            browser_resolved: dict[str, str] = {**browser_direct_resolved, **session_resolved}
             _pahe_debug(
                 "fallback_resolution_summary",
                 unresolved_count=len(unresolved_kwik_links),
-                browser_direct_count=0,
+                browser_direct_count=len(browser_direct_resolved),
                 final_resolved_count=len(browser_resolved),
                 warmed=warmed,
             )
