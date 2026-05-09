@@ -40,6 +40,7 @@ KWIK_SESSION_COOKIES = RequestsCookieJar()
 
 PAHE_DEBUG_LOG_PATH = os.environ.get("SENPWAI_PAHE_DEBUG_LOG", r"D:\Blackm\Documents\senpwai_pahe_debug.log")
 PLAYWRIGHT_HEADLESS = os.environ.get("SENPWAI_PLAYWRIGHT_HEADLESS", "1") != "0"
+PLAYWRIGHT_MANUAL_WAIT_MS = int(os.environ.get("SENPWAI_PLAYWRIGHT_MANUAL_WAIT_MS", "90000"))
 
 
 def _pahe_debug(event: str, **data: Any) -> None:
@@ -522,93 +523,109 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
     if not kwik_page_links:
         return {}
 
-    resolved: dict[str, str] = {}
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=PLAYWRIGHT_HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context()
-        page = context.new_page()
-        page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+    def _run_browser_resolution(headless: bool) -> dict[str, str]:
+        resolved: dict[str, str] = {}
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = browser.new_context()
+            page = context.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
 
-        # Warm up challenge/session once on the first link, then reuse same context.
-        warmup_link = kwik_page_links[0]
-        page.goto(warmup_link, wait_until="domcontentloaded")
-        warmup_cleared = wait_for_challenge_to_clear(page)
-        if not warmup_cleared:
-            probe = _probe_page_state(page)
-            _pahe_debug("browser_warmup_failed", warmup_link=warmup_link, final_url=page.url, probe=probe)
-            browser.close()
-            return {}
+            # Warm up challenge/session once on the first link, then reuse same context.
+            warmup_link = kwik_page_links[0]
+            page.goto(warmup_link, wait_until="domcontentloaded")
+            warmup_cleared = wait_for_challenge_to_clear(page)
+            if not warmup_cleared and not headless:
+                _pahe_debug("browser_manual_wait_start", wait_ms=PLAYWRIGHT_MANUAL_WAIT_MS, warmup_link=warmup_link)
+                page.wait_for_timeout(PLAYWRIGHT_MANUAL_WAIT_MS)
+                warmup_cleared = wait_for_challenge_to_clear(page)
+            if not warmup_cleared:
+                probe = _probe_page_state(page)
+                _pahe_debug("browser_warmup_failed", warmup_link=warmup_link, final_url=page.url, probe=probe, headless=headless)
+                browser.close()
+                return {}
 
-        for kwik_page_link in kwik_page_links:
-            network_candidates: list[str] = []
+            for kwik_page_link in kwik_page_links:
+                network_candidates: list[str] = []
 
-            def capture_response(response):
-                url = response.url
-                headers = response.headers
-                content_disposition = headers.get("content-disposition", "")
-                content_type = headers.get("content-type", "")
-                if (
-                    "attachment" in content_disposition.lower()
-                    or "video" in content_type.lower()
-                    or "octet-stream" in content_type.lower()
-                ):
-                    network_candidates.append(url)
+                def capture_response(response):
+                    url = response.url
+                    headers = response.headers
+                    content_disposition = headers.get("content-disposition", "")
+                    content_type = headers.get("content-type", "")
+                    if (
+                        "attachment" in content_disposition.lower()
+                        or "video" in content_type.lower()
+                        or "octet-stream" in content_type.lower()
+                    ):
+                        network_candidates.append(url)
 
-            context.on("response", capture_response)
-            page.goto(kwik_page_link, wait_until="domcontentloaded")
-            page.wait_for_timeout(1000)
-
-            submit_selectors = [
-                "form button[type='submit']",
-                "button[type='submit']",
-                "form input[type='submit']",
-                "a#downloadButton",
-            ]
-            for selector in submit_selectors:
-                element = page.query_selector(selector)
-                if not element:
-                    continue
-                element_href = element.get_attribute("href")
-                href_candidate: str | None = None
-                if element_href and element_href.startswith("http"):
-                    href_candidate = element_href
-                    network_candidates.append(element_href)
-                try:
-                    form_action = page.eval_on_selector(
-                        "form", "form => form?.action || ''"
-                    )
-                    if isinstance(form_action, str) and form_action.startswith("http"):
-                        network_candidates.append(form_action)
-                except Exception:
-                    pass
-                # Do not click download actions in browser warmup path.
+                context.on("response", capture_response)
+                page.goto(kwik_page_link, wait_until="domcontentloaded")
                 page.wait_for_timeout(1000)
-                if href_candidate and "/d/" not in href_candidate:
+
+                submit_selectors = [
+                    "form button[type='submit']",
+                    "button[type='submit']",
+                    "form input[type='submit']",
+                    "a#downloadButton",
+                ]
+                for selector in submit_selectors:
+                    element = page.query_selector(selector)
+                    if not element:
+                        continue
+                    element_href = element.get_attribute("href")
+                    href_candidate: str | None = None
+                    if element_href and element_href.startswith("http"):
+                        href_candidate = element_href
+                        network_candidates.append(element_href)
+                    try:
+                        form_action = page.eval_on_selector(
+                            "form", "form => form?.action || ''"
+                        )
+                        if isinstance(form_action, str) and form_action.startswith("http"):
+                            network_candidates.append(form_action)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1000)
+                    if href_candidate and "/d/" not in href_candidate:
+                        break
                     break
-                break
 
-            popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
-            if network_candidates:
-                best_candidate = pick_candidate_with_length(network_candidates, kwik_page_link)
-                if best_candidate:
-                    resolved[kwik_page_link] = best_candidate
-                _pahe_debug("browser_link_resolved_network", kwik_page_link=kwik_page_link, resolved_url=resolved.get(kwik_page_link), candidates=network_candidates)
-            elif popup_urls:
-                resolved[kwik_page_link] = popup_urls[-1]
-                _pahe_debug("browser_link_resolved_popup", kwik_page_link=kwik_page_link, resolved_url=resolved[kwik_page_link], popup_urls=popup_urls)
-            elif page.url != kwik_page_link:
-                resolved[kwik_page_link] = page.url
+                popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
+                if network_candidates:
+                    best_candidate = pick_candidate_with_length(network_candidates, kwik_page_link)
+                    if best_candidate:
+                        resolved[kwik_page_link] = best_candidate
+                    _pahe_debug("browser_link_resolved_network", kwik_page_link=kwik_page_link, resolved_url=resolved.get(kwik_page_link), candidates=network_candidates)
+                elif popup_urls:
+                    resolved[kwik_page_link] = popup_urls[-1]
+                    _pahe_debug("browser_link_resolved_popup", kwik_page_link=kwik_page_link, resolved_url=resolved[kwik_page_link], popup_urls=popup_urls)
+                elif page.url != kwik_page_link:
+                    resolved[kwik_page_link] = page.url
 
-            context.remove_listener("response", capture_response)
+                context.remove_listener("response", capture_response)
 
-        cookies = context.cookies()
-        _pahe_debug("browser_context_cookies", count=len(cookies), cookies=cookies)
-        browser.close()
+            cookies = context.cookies()
+            _pahe_debug("browser_context_cookies", count=len(cookies), cookies=cookies, headless=headless)
+            browser.close()
+        return resolved, cookies
+
+    resolved: dict[str, str] = {}
+    cookies: list[dict[str, Any]] = []
+    result = _run_browser_resolution(PLAYWRIGHT_HEADLESS)
+    if isinstance(result, tuple):
+        resolved, cookies = result
+    if not resolved and PLAYWRIGHT_HEADLESS:
+        _pahe_debug("browser_headless_retry_headed")
+        result = _run_browser_resolution(False)
+        if isinstance(result, tuple):
+            resolved, cookies = result
     global KWIK_SESSION_COOKIES
     KWIK_SESSION_COOKIES = RequestsCookieJar()
 
