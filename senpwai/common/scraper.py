@@ -449,7 +449,10 @@ class Download(ProgressFunction):
         resource_length_str = response.headers.get("Content-Length", None)
         redirect_url = response.url
         if resource_length_str is None:
-            raise NoResourceLengthException(url, redirect_url)
+            # Some hosts (e.g., anti-bot/CDN wrapped links) omit Content-Length
+            # even though they are downloadable. Fall back to unknown size instead
+            # of hard-failing download initialization.
+            return (0, redirect_url)
         return (int(resource_length_str), redirect_url)
 
     def cancel(self):
