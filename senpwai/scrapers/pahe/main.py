@@ -424,37 +424,49 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         _pahe_debug("browser_resolve_import_error", error=str(exc))
         return {}
 
-    def wait_for_challenge_to_clear(page, timeout_ms: int = 120000) -> bool:
-        challenge_indicators = (
-            "just a moment",
-            "verify you are human",
-            "checking your browser",
-            "cf-challenge",
-            "cloudflare",
-        )
-        page.wait_for_timeout(1500)
+    def _probe_page_state(page) -> dict[str, Any]:
         try:
-            page.wait_for_function(
+            state = page.evaluate(
                 """
-                (indicators) => {
+                () => {
                     const text = (document.body?.innerText || '').toLowerCase();
-                    const hasChallengeText = indicators.some((indicator) => text.includes(indicator));
-                    const challengeFrame = !!document.querySelector("iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']");
-                    return !hasChallengeText && !challengeFrame;
+                    const title = (document.title || '').toLowerCase();
+                    const challengeIframes = document.querySelectorAll("iframe[src*='challenges.cloudflare.com'], iframe[title*='challenge'], iframe[src*='turnstile']").length;
+                    const hasSubmit = !!document.querySelector("form button[type='submit'], button[type='submit'], form input[type='submit'], a#downloadButton");
+                    const hasForm = !!document.querySelector("form");
+                    const hasChallengeText = ["just a moment", "verify you are human", "checking your browser", "cf-challenge", "cloudflare"]
+                        .some((i) => text.includes(i) || title.includes(i));
+                    return { challengeIframes, hasSubmit, hasForm, hasChallengeText, bodyTextLength: text.length, title };
                 }
-                """,
-                challenge_indicators,
-                timeout=timeout_ms,
+                """
             )
-            try:
-                page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                # Download/stream pages often never reach networkidle; challenge can still be done.
-                pass
-            page.wait_for_timeout(1000)
-            return True
-        except Exception:
-            return False
+            return cast(dict[str, Any], state)
+        except Exception as exc:
+            return {"probe_error": str(exc)}
+
+    def wait_for_challenge_to_clear(page, timeout_ms: int = 120000) -> bool:
+        elapsed = 0
+        step_ms = 2000
+        while elapsed < timeout_ms:
+            page.wait_for_timeout(step_ms)
+            elapsed += step_ms
+            probe = _probe_page_state(page)
+            page_url = page.url
+            success = bool(
+                ("/f/" in page_url and probe.get("hasForm"))
+                or probe.get("hasSubmit")
+                or ("/d/" in page_url)
+            )
+            _pahe_debug(
+                "browser_challenge_probe",
+                elapsed_ms=elapsed,
+                page_url=page_url,
+                probe=probe,
+                success=success,
+            )
+            if success:
+                return True
+        return False
 
     def wait_for_manual_verification(page) -> bool:
         """
@@ -463,8 +475,9 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         """
         try:
             page.bring_to_front()
-        except Exception:
-            pass
+            _pahe_debug("browser_bring_to_front_ok")
+        except Exception as exc:
+            _pahe_debug("browser_bring_to_front_fail", error=str(exc))
         # Give enough time for manual checkbox completion without stalling indefinitely.
         page.wait_for_timeout(60000)
         return wait_for_challenge_to_clear(page, timeout_ms=45000)
@@ -491,7 +504,8 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         if not warmup_cleared:
             warmup_cleared = wait_for_manual_verification(page)
         if not warmup_cleared:
-            _pahe_debug("browser_warmup_failed", warmup_link=warmup_link)
+            probe = _probe_page_state(page)
+            _pahe_debug("browser_warmup_failed", warmup_link=warmup_link, final_url=page.url, probe=probe)
             browser.close()
             return {}
 
@@ -686,12 +700,17 @@ class GetDirectDownloadLinks(ProgressFunction):
                     progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
             # Warm up challenge/session once on first link, then close browser and retry normally.
-            browser_resolved_direct = _resolve_direct_links_with_browser([unresolved_kwik_links[0]])
-            browser_resolved = dict(browser_resolved_direct)
+            browser_resolved: dict[str, str] = {}
+            for idx, warmup_link in enumerate(unresolved_kwik_links):
+                browser_resolved_direct = _resolve_direct_links_with_browser([warmup_link])
+                _pahe_debug("fallback_warmup_attempt", attempt_index=idx, warmup_link=warmup_link, resolved_count=len(browser_resolved_direct))
+                if browser_resolved_direct:
+                    browser_resolved.update(browser_resolved_direct)
+                    break
             remaining = [link for link in unresolved_kwik_links if link not in browser_resolved]
             if remaining:
                 browser_resolved.update(_retry_kwik_links_with_session(remaining))
-            _pahe_debug("fallback_resolution_summary", unresolved_count=len(unresolved_kwik_links), browser_direct_count=len(browser_resolved_direct), final_resolved_count=len(browser_resolved))
+            _pahe_debug("fallback_resolution_summary", unresolved_count=len(unresolved_kwik_links), browser_direct_count=len(browser_resolved), final_resolved_count=len(browser_resolved))
             direct_download_links.extend(
                 browser_resolved[link]
                 for link in unresolved_kwik_links
