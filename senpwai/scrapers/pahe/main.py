@@ -444,6 +444,29 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
         except Exception as exc:
             return {"probe_error": str(exc)}
 
+    def pick_best_candidate(candidates: list[str]) -> str | None:
+        if not candidates:
+            return None
+
+        def score(url: str) -> int:
+            u = url.lower()
+            points = 0
+            if "animepahe" in u or "subsplease" in u or "file=" in u:
+                points += 100
+            if "owocdn" in u or "vault-" in u:
+                points += 40
+            if "cdn.nightdestruct.com" in u or "/sb/notifications/" in u:
+                points -= 200
+            if "kwik.cx/d/" in u:
+                points -= 20
+            if ".mp4" in u:
+                points += 10
+            return points
+
+        ranked = sorted(candidates, key=score, reverse=True)
+        _pahe_debug("browser_candidate_ranked", ranked=ranked)
+        return ranked[0]
+
     def wait_for_challenge_to_clear(page, timeout_ms: int = 120000) -> bool:
         elapsed = 0
         step_ms = 2000
@@ -581,8 +604,10 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
 
             popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
             if network_candidates:
-                resolved[kwik_page_link] = network_candidates[-1]
-                _pahe_debug("browser_link_resolved_network", kwik_page_link=kwik_page_link, resolved_url=resolved[kwik_page_link], candidates=network_candidates)
+                best_candidate = pick_best_candidate(network_candidates)
+                if best_candidate:
+                    resolved[kwik_page_link] = best_candidate
+                _pahe_debug("browser_link_resolved_network", kwik_page_link=kwik_page_link, resolved_url=resolved.get(kwik_page_link), candidates=network_candidates)
             elif popup_urls:
                 resolved[kwik_page_link] = popup_urls[-1]
                 _pahe_debug("browser_link_resolved_popup", kwik_page_link=kwik_page_link, resolved_url=resolved[kwik_page_link], popup_urls=popup_urls)
