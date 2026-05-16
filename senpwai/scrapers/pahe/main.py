@@ -41,6 +41,9 @@ KWIK_SESSION_COOKIES = RequestsCookieJar()
 PAHE_DEBUG_LOG_PATH = os.environ.get("SENPWAI_PAHE_DEBUG_LOG", r"D:\Blackm\Documents\senpwai_pahe_debug.log")
 PLAYWRIGHT_HEADLESS = os.environ.get("SENPWAI_PLAYWRIGHT_HEADLESS", "1") != "0"
 PLAYWRIGHT_MANUAL_WAIT_MS = int(os.environ.get("SENPWAI_PLAYWRIGHT_MANUAL_WAIT_MS", "90000"))
+PLAYWRIGHT_HEADLESS_CHALLENGE_TIMEOUT_MS = int(
+    os.environ.get("SENPWAI_PLAYWRIGHT_HEADLESS_CHALLENGE_TIMEOUT_MS", "20000")
+)
 
 
 def _pahe_debug(event: str, **data: Any) -> None:
@@ -542,7 +545,17 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
             # Warm up challenge/session once on the first link, then reuse same context.
             warmup_link = kwik_page_links[0]
             page.goto(warmup_link, wait_until="domcontentloaded")
-            warmup_cleared = wait_for_challenge_to_clear(page)
+            warmup_timeout_ms = (
+                PLAYWRIGHT_HEADLESS_CHALLENGE_TIMEOUT_MS if headless else 120000
+            )
+            warmup_cleared = wait_for_challenge_to_clear(page, timeout_ms=warmup_timeout_ms)
+            _pahe_debug(
+                "browser_warmup_probe_done",
+                warmup_link=warmup_link,
+                headless=headless,
+                timeout_ms=warmup_timeout_ms,
+                cleared=warmup_cleared,
+            )
             if not warmup_cleared and not headless:
                 _pahe_debug("browser_manual_wait_start", wait_ms=PLAYWRIGHT_MANUAL_WAIT_MS, warmup_link=warmup_link)
                 page.wait_for_timeout(PLAYWRIGHT_MANUAL_WAIT_MS)
