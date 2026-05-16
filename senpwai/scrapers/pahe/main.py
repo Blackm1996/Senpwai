@@ -780,13 +780,22 @@ class GetDirectDownloadLinks(ProgressFunction):
                 unresolved_kwik_links.append(kwik_page_link)
                 unresolved_progress_pending += 1
             else:
-                _pahe_debug("kwik_direct_link_resolved_normal", kwik_page_link=kwik_page_link, direct_link=direct_download_link)
-                direct_download_links.append(direct_download_link)
-                self.resume.wait()
-                if self.cancelled:
-                    return []
-                if progress_update_callback:
-                    progress_update_callback(1)
+                if "kwik.cx/" in direct_download_link:
+                    _pahe_debug(
+                        "kwik_direct_link_intermediate",
+                        kwik_page_link=kwik_page_link,
+                        direct_link=direct_download_link,
+                    )
+                    unresolved_kwik_links.append(kwik_page_link)
+                    unresolved_progress_pending += 1
+                else:
+                    _pahe_debug("kwik_direct_link_resolved_normal", kwik_page_link=kwik_page_link, direct_link=direct_download_link)
+                    direct_download_links.append(direct_download_link)
+                    self.resume.wait()
+                    if self.cancelled:
+                        return []
+                    if progress_update_callback:
+                        progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
             # Resolve all unresolved links in one browser session to keep the same challenge context.
             browser_direct_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
