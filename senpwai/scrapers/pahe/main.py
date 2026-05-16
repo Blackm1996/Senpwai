@@ -534,14 +534,13 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
     if not kwik_page_links:
         return {}
 
-    def _run_browser_resolution(headless: bool) -> dict[str, str]:
-        resolved: dict[str, str] = {}
+    def _run_browser_resolution(headless: bool) -> list[dict[str, Any]]:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=headless,
                 args=["--disable-blink-features=AutomationControlled"],
             )
-            context = browser.new_context()
+            context = browser.new_context(accept_downloads=False)
             page = context.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -571,102 +570,23 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 browser.close()
                 return {}
 
-            for kwik_page_link in kwik_page_links:
-                network_candidates: list[str] = []
-
-                def capture_response(response):
-                    url = response.url
-                    headers = response.headers
-                    content_disposition = headers.get("content-disposition", "")
-                    content_type = headers.get("content-type", "")
-                    if (
-                        "attachment" in content_disposition.lower()
-                        or "video" in content_type.lower()
-                        or "octet-stream" in content_type.lower()
-                    ):
-                        network_candidates.append(url)
-
-                context.on("response", capture_response)
-                page.goto(kwik_page_link, wait_until="domcontentloaded")
-                page.wait_for_timeout(1000)
-
-                submit_selectors = [
-                    "form button[type='submit']",
-                    "button[type='submit']",
-                    "form input[type='submit']",
-                    "a#downloadButton",
-                ]
-                clicked_download = False
-                for selector in submit_selectors:
-                    element = page.query_selector(selector)
-                    if not element:
-                        continue
-                    element_href = element.get_attribute("href")
-                    href_candidate: str | None = None
-                    if element_href and element_href.startswith("http"):
-                        href_candidate = element_href
-                        network_candidates.append(element_href)
-                    try:
-                        form_action = page.eval_on_selector(
-                            "form", "form => form?.action || ''"
-                        )
-                        if isinstance(form_action, str) and form_action.startswith("http"):
-                            network_candidates.append(form_action)
-                    except Exception:
-                        pass
-                    # Trigger the same action a user performs on the page, but keep
-                    # browser downloads disabled so the app remains the downloader.
-                    try:
-                        element.click()
-                        clicked_download = True
-                        _pahe_debug(
-                            "browser_download_click",
-                            kwik_page_link=kwik_page_link,
-                            selector=selector,
-                        )
-                    except Exception as exc:
-                        _pahe_debug(
-                            "browser_download_click_error",
-                            kwik_page_link=kwik_page_link,
-                            selector=selector,
-                            error=str(exc),
-                        )
-                    page.wait_for_timeout(1500)
-                    if href_candidate and "/d/" not in href_candidate:
-                        break
-                    break
-                if not clicked_download:
-                    _pahe_debug("browser_download_not_clicked", kwik_page_link=kwik_page_link)
-
-                popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
-                if network_candidates:
-                    best_candidate = pick_candidate_with_length(network_candidates, kwik_page_link)
-                    if best_candidate:
-                        resolved[kwik_page_link] = best_candidate
-                    _pahe_debug("browser_link_resolved_network", kwik_page_link=kwik_page_link, resolved_url=resolved.get(kwik_page_link), candidates=network_candidates)
-                elif popup_urls:
-                    resolved[kwik_page_link] = popup_urls[-1]
-                    _pahe_debug("browser_link_resolved_popup", kwik_page_link=kwik_page_link, resolved_url=resolved[kwik_page_link], popup_urls=popup_urls)
-                elif page.url != kwik_page_link:
-                    resolved[kwik_page_link] = page.url
-
-                context.remove_listener("response", capture_response)
+            _pahe_debug(
+                "browser_session_warmed",
+                warmup_link=warmup_link,
+                final_url=page.url,
+                headless=headless,
+                link_count=len(kwik_page_links),
+            )
 
             cookies = context.cookies()
             _pahe_debug("browser_context_cookies", count=len(cookies), cookies=cookies, headless=headless)
             browser.close()
-        return resolved, cookies
+        return cookies
 
-    resolved: dict[str, str] = {}
-    cookies: list[dict[str, Any]] = []
-    result = _run_browser_resolution(PLAYWRIGHT_HEADLESS)
-    if isinstance(result, tuple):
-        resolved, cookies = result
-    if not resolved and PLAYWRIGHT_HEADLESS:
+    cookies: list[dict[str, Any]] = _run_browser_resolution(PLAYWRIGHT_HEADLESS)
+    if not cookies and PLAYWRIGHT_HEADLESS:
         _pahe_debug("browser_headless_retry_headed")
-        result = _run_browser_resolution(False)
-        if isinstance(result, tuple):
-            resolved, cookies = result
+        cookies = _run_browser_resolution(False)
     global KWIK_SESSION_COOKIES
     KWIK_SESSION_COOKIES = RequestsCookieJar()
 
@@ -680,8 +600,8 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
             domain=domain,
             path=cookie.get("path", "/"),
         )
-    _pahe_debug("browser_resolve_done", resolved_count=len(resolved), resolved=resolved, kwik_session_cookies=_cookie_snapshot(KWIK_SESSION_COOKIES))
-    return resolved
+    _pahe_debug("browser_session_ready", kwik_session_cookies=_cookie_snapshot(KWIK_SESSION_COOKIES))
+    return {}
 
 
 def get_kwik_session_cookies() -> RequestsCookieJar:
@@ -836,22 +756,21 @@ class GetDirectDownloadLinks(ProgressFunction):
                     if progress_update_callback:
                         progress_update_callback(1)
         if unresolved_kwik_links and _playwright_is_available():
-            # Resolve all unresolved links in one browser session to keep the same challenge context.
-            browser_direct_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
+            # Warm challenge/session once in browser, then resolve all episodes via HTTP using that session.
+            _resolve_direct_links_with_browser(unresolved_kwik_links)
             warmed = _kwik_session_is_warmed()
-            unresolved_after_browser = [
-                link for link in unresolved_kwik_links if link not in browser_direct_resolved
-            ]
             session_resolved: dict[str, str] = {}
             if warmed:
-                to_retry = unresolved_after_browser or unresolved_kwik_links
-                _pahe_debug("fallback_session_retry_start", retry_count=len(to_retry))
-                session_resolved = _retry_kwik_links_with_session(to_retry)
-            browser_resolved: dict[str, str] = {**browser_direct_resolved, **session_resolved}
+                _pahe_debug("fallback_session_retry_start", retry_count=len(unresolved_kwik_links))
+                session_resolved = _retry_kwik_links_with_session(unresolved_kwik_links)
+            browser_resolved: dict[str, str] = session_resolved
+            unresolved_after_browser = [
+                link for link in unresolved_kwik_links if link not in browser_resolved
+            ]
             _pahe_debug(
                 "fallback_resolution_summary",
                 unresolved_count=len(unresolved_kwik_links),
-                browser_direct_count=len(browser_direct_resolved),
+                browser_direct_count=0,
                 final_resolved_count=len(browser_resolved),
                 warmed=warmed,
                 unresolved_after_browser=unresolved_after_browser,
