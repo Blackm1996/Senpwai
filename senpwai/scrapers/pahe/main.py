@@ -569,7 +569,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                 probe = _probe_page_state(page)
                 _pahe_debug("browser_warmup_failed", warmup_link=warmup_link, final_url=page.url, probe=probe, headless=headless)
                 browser.close()
-                return {}
+                return [], ""
 
             _pahe_debug(
                 "browser_session_warmed",
