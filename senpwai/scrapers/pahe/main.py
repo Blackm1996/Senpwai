@@ -36,6 +36,7 @@ from senpwai.scrapers.pahe.constants import (
 FIRST_REQUEST = True
 COOKIES = {"__ddg1_": "", "__ddg2_": ""}
 KWIK_SESSION_COOKIES = RequestsCookieJar()
+KWIK_SESSION_USER_AGENT = ""
 
 
 PAHE_DEBUG_LOG_PATH = os.environ.get("SENPWAI_PAHE_DEBUG_LOG", r"D:\Blackm\Documents\senpwai_pahe_debug.log")
@@ -534,7 +535,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
     if not kwik_page_links:
         return {}
 
-    def _run_browser_resolution(headless: bool) -> list[dict[str, Any]]:
+    def _run_browser_resolution(headless: bool) -> tuple[list[dict[str, Any]], str]:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=headless,
@@ -579,16 +580,19 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
             )
 
             cookies = context.cookies()
+            user_agent = page.evaluate("() => navigator.userAgent")
             _pahe_debug("browser_context_cookies", count=len(cookies), cookies=cookies, headless=headless)
             browser.close()
-        return cookies
+        return cookies, user_agent
 
-    cookies: list[dict[str, Any]] = _run_browser_resolution(PLAYWRIGHT_HEADLESS)
+    cookies, user_agent = _run_browser_resolution(PLAYWRIGHT_HEADLESS)
     if not cookies and PLAYWRIGHT_HEADLESS:
         _pahe_debug("browser_headless_retry_headed")
-        cookies = _run_browser_resolution(False)
+        cookies, user_agent = _run_browser_resolution(False)
     global KWIK_SESSION_COOKIES
+    global KWIK_SESSION_USER_AGENT
     KWIK_SESSION_COOKIES = RequestsCookieJar()
+    KWIK_SESSION_USER_AGENT = user_agent if isinstance(user_agent, str) else ""
 
     for cookie in cookies:
         domain = cookie.get("domain", "")
@@ -599,8 +603,13 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
             cookie["value"],
             domain=domain,
             path=cookie.get("path", "/"),
+            secure=bool(cookie.get("secure", False)),
         )
-    _pahe_debug("browser_session_ready", kwik_session_cookies=_cookie_snapshot(KWIK_SESSION_COOKIES))
+    _pahe_debug(
+        "browser_session_ready",
+        kwik_session_cookies=_cookie_snapshot(KWIK_SESSION_COOKIES),
+        user_agent=KWIK_SESSION_USER_AGENT,
+    )
     return {}
 
 
@@ -616,10 +625,30 @@ def _kwik_session_is_warmed() -> bool:
 def _retry_kwik_links_with_session(kwik_page_links: list[str]) -> dict[str, str]:
     resolved: dict[str, str] = {}
     kwik_cookies = get_kwik_session_cookies()
+    extra_headers = (
+        {"User-Agent": KWIK_SESSION_USER_AGENT} if KWIK_SESSION_USER_AGENT else {}
+    )
     for kwik_page_link in kwik_page_links:
-        response = CLIENT.get(kwik_page_link, cookies=kwik_cookies)
+        response = CLIENT.get(
+            kwik_page_link,
+            cookies=kwik_cookies,
+            headers=CLIENT.make_headers(extra_headers),
+        )
+        _pahe_debug(
+            "session_retry_get",
+            kwik_page_link=kwik_page_link,
+            status_code=response.status_code,
+            response_url=response.url,
+            text_prefix=response.text[:180],
+            using_browser_ua=bool(KWIK_SESSION_USER_AGENT),
+        )
         match = PARAM_REGEX.search(response.text)
         if not match:
+            _pahe_debug(
+                "session_retry_param_regex_miss",
+                kwik_page_link=kwik_page_link,
+                status_code=response.status_code,
+            )
             continue
         full_key, key, v1, v2 = match.group(1), match.group(2), match.group(3), match.group(4)
         form = decrypt_post_form(full_key, key, int(v1), int(v2))
@@ -628,12 +657,19 @@ def _retry_kwik_links_with_session(kwik_page_links: list[str]) -> dict[str, str]
         token_value = cast(str, cast(Tag, soup.input)["value"])
         post_response = CLIENT.post(
             post_url,
-            headers=CLIENT.make_headers({"Referer": kwik_page_link}),
+            headers=CLIENT.make_headers({"Referer": kwik_page_link, **extra_headers}),
             cookies=kwik_cookies,
             data={"_token": token_value},
             allow_redirects=False,
         )
         direct_download_link = post_response.headers.get("Location")
+        _pahe_debug(
+            "session_retry_post",
+            kwik_page_link=kwik_page_link,
+            post_url=post_url,
+            status_code=post_response.status_code,
+            location=direct_download_link,
+        )
         if direct_download_link:
             resolved[kwik_page_link] = direct_download_link
     return resolved
