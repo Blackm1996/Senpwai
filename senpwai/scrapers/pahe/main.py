@@ -505,9 +505,12 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
             probe = _probe_page_state(page)
             page_url = page.url
             success = bool(
-                ("/f/" in page_url and probe.get("hasForm"))
-                or probe.get("hasSubmit")
-                or ("/d/" in page_url)
+                (
+                    "/f/" in page_url
+                    and (probe.get("hasForm") or probe.get("hasSubmit"))
+                    and not probe.get("hasChallengeText")
+                )
+                or ("/d/" in page_url and not probe.get("hasChallengeText"))
             )
             _pahe_debug(
                 "browser_challenge_probe",
@@ -647,6 +650,11 @@ def get_kwik_session_cookies() -> RequestsCookieJar:
     return KWIK_SESSION_COOKIES.copy()
 
 
+def _kwik_session_is_warmed() -> bool:
+    names = {cookie.name for cookie in KWIK_SESSION_COOKIES}
+    return bool(names.intersection({"cf_clearance", "kwik_session", "srv"}))
+
+
 def _retry_kwik_links_with_session(kwik_page_links: list[str]) -> dict[str, str]:
     resolved: dict[str, str] = {}
     kwik_cookies = get_kwik_session_cookies()
@@ -782,13 +790,15 @@ class GetDirectDownloadLinks(ProgressFunction):
         if unresolved_kwik_links and _playwright_is_available():
             # Resolve all unresolved links in one browser session to keep the same challenge context.
             browser_direct_resolved = _resolve_direct_links_with_browser(unresolved_kwik_links)
-            warmed = bool(browser_direct_resolved)
+            warmed = _kwik_session_is_warmed()
             unresolved_after_browser = [
                 link for link in unresolved_kwik_links if link not in browser_direct_resolved
             ]
             session_resolved: dict[str, str] = {}
-            if warmed and unresolved_after_browser:
-                session_resolved = _retry_kwik_links_with_session(unresolved_after_browser)
+            if warmed:
+                to_retry = unresolved_after_browser or unresolved_kwik_links
+                _pahe_debug("fallback_session_retry_start", retry_count=len(to_retry))
+                session_resolved = _retry_kwik_links_with_session(to_retry)
             browser_resolved: dict[str, str] = {**browser_direct_resolved, **session_resolved}
             _pahe_debug(
                 "fallback_resolution_summary",
