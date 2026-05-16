@@ -591,6 +591,7 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                     "form input[type='submit']",
                     "a#downloadButton",
                 ]
+                clicked_download = False
                 for selector in submit_selectors:
                     element = page.query_selector(selector)
                     if not element:
@@ -608,10 +609,40 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                             network_candidates.append(form_action)
                     except Exception:
                         pass
-                    page.wait_for_timeout(1000)
+                    # Trigger the same action a user performs on the page.
+                    try:
+                        with page.expect_download(timeout=8000) as download_info:
+                            element.click()
+                        download = download_info.value
+                        dl_url = download.url
+                        if dl_url:
+                            network_candidates.append(dl_url)
+                        _pahe_debug(
+                            "browser_download_event",
+                            kwik_page_link=kwik_page_link,
+                            selector=selector,
+                            download_url=dl_url,
+                            filename=download.suggested_filename,
+                        )
+                        clicked_download = True
+                    except Exception as exc:
+                        _pahe_debug(
+                            "browser_download_event_miss",
+                            kwik_page_link=kwik_page_link,
+                            selector=selector,
+                            error=str(exc),
+                        )
+                        try:
+                            element.click()
+                            clicked_download = True
+                        except Exception:
+                            pass
+                    page.wait_for_timeout(1500)
                     if href_candidate and "/d/" not in href_candidate:
                         break
                     break
+                if not clicked_download:
+                    _pahe_debug("browser_download_not_clicked", kwik_page_link=kwik_page_link)
 
                 popup_urls = [p.url for p in context.pages if p.url and "kwik" not in p.url]
                 if network_candidates:
