@@ -95,23 +95,28 @@ def _refresh_pahe_cookies_with_browser(url: str) -> bool:
         _pahe_debug("refresh_pahe_cookies_import_error", error=str(exc))
         return False
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=PLAYWRIGHT_HEADLESS,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        context = browser.new_context()
-        page = context.new_page()
-        page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        page.goto(url, wait_until="domcontentloaded")
-        page.wait_for_timeout(8000)
-        cookies = context.cookies()
-        _pahe_debug("refresh_pahe_cookies_browser_captured", count=len(cookies), cookies=cookies)
-        browser.close()
+    cookies: list[dict[str, Any]] = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=PLAYWRIGHT_HEADLESS,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = browser.new_context()
+            page = context.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(8000)
+            cookies = context.cookies()
+            _pahe_debug("refresh_pahe_cookies_browser_captured", count=len(cookies), cookies=cookies)
+            browser.close()
+    except Exception as exc:
+        _pahe_debug("refresh_pahe_cookies_browser_error", url=url, error=str(exc))
+        return False
 
     pahe_cookies = {
         cookie["name"]: cookie["value"]
@@ -782,7 +787,8 @@ class GetDirectDownloadLinks(ProgressFunction):
         progress_update_callback: Callable[[int], None] | None = None,
     ) -> list[str]:
         direct_download_links: list[str] = []
-        _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
+        refreshed = _refresh_pahe_cookies_with_browser(PAHE_HOME_URL)
+        _pahe_debug("refresh_pahe_cookies_initial_result", refreshed=refreshed)
         unresolved_kwik_links: list[str] = []
         unresolved_progress_pending = 0
         for pahewin_link in pahewin_download_page_links:
@@ -862,15 +868,25 @@ class GetDirectDownloadLinks(ProgressFunction):
                 unresolved_after_browser=unresolved_after_browser,
             )
             resolved_count = 0
+            intermediate_links: list[str] = []
             for link in unresolved_kwik_links:
                 if link not in browser_resolved:
                     continue
                 upgraded = _upgrade_kwik_download_url(browser_resolved[link], link)
                 if "kwik.cx/d/" in upgraded:
                     _pahe_debug("fallback_unverified_download_url", kwik_page_link=link, resolved_url=upgraded)
+                    intermediate_links.append(upgraded)
                     continue
                 direct_download_links.append(upgraded)
                 resolved_count += 1
+            if resolved_count == 0 and intermediate_links:
+                _pahe_debug(
+                    "fallback_accept_intermediate_urls",
+                    count=len(intermediate_links),
+                    urls=intermediate_links,
+                )
+                direct_download_links.extend(intermediate_links)
+                resolved_count = len(intermediate_links)
             for _ in range(resolved_count):
                 self.resume.wait()
                 if self.cancelled:
