@@ -104,7 +104,7 @@ def _refresh_pahe_cookies_with_browser(url: str) -> bool:
                     "--disable-blink-features=AutomationControlled",
                 ],
             )
-            context = browser.new_context()
+            context = browser.new_context(accept_downloads=False)
             page = context.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -614,34 +614,23 @@ def _resolve_direct_links_with_browser(kwik_page_links: list[str]) -> dict[str, 
                             network_candidates.append(form_action)
                     except Exception:
                         pass
-                    # Trigger the same action a user performs on the page.
+                    # Trigger the same action a user performs on the page, but keep
+                    # browser downloads disabled so the app remains the downloader.
                     try:
-                        with page.expect_download(timeout=8000) as download_info:
-                            element.click()
-                        download = download_info.value
-                        dl_url = download.url
-                        if dl_url:
-                            network_candidates.append(dl_url)
+                        element.click()
+                        clicked_download = True
                         _pahe_debug(
-                            "browser_download_event",
+                            "browser_download_click",
                             kwik_page_link=kwik_page_link,
                             selector=selector,
-                            download_url=dl_url,
-                            filename=download.suggested_filename,
                         )
-                        clicked_download = True
                     except Exception as exc:
                         _pahe_debug(
-                            "browser_download_event_miss",
+                            "browser_download_click_error",
                             kwik_page_link=kwik_page_link,
                             selector=selector,
                             error=str(exc),
                         )
-                        try:
-                            element.click()
-                            clicked_download = True
-                        except Exception:
-                            pass
                     page.wait_for_timeout(1500)
                     if href_candidate and "/d/" not in href_candidate:
                         break
